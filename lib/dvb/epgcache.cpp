@@ -28,9 +28,9 @@
 #include <dvbsi++/descriptor_tag.h>
 
 /* Interval between "garbage collect" cycles */
-#define CLEAN_INTERVAL 60000    //  1 min
+#define CLEAN_INTERVAL 800    //  1 min
 /* Restart EPG data capture */
-#define UPDATE_INTERVAL 3600000  // 60 min
+#define UPDATE_INTERVAL 800  // 1 min
 /* Time to wait after tuning in before EPG data capturing starts */
 #define ZAP_DELAY 2000          // 2 sec
 
@@ -335,6 +335,12 @@ void eventData::load(FILE *f)
 		p.data[0] = header[0];
 		p.data[1] = header[1];
 		ret = fread(p.data+2, bytes-2, 1, f);
+		// make sure we are not leaking memory
+		DescriptorMap::iterator it = descriptors.find(id);
+		if (it != descriptors.end())
+		{
+			delete [] it->second.data; // free descriptor memory
+		}
 		descriptors[id] = p;
 		--size;
 	}
@@ -2361,6 +2367,8 @@ void eEPGCache::channel_data::abortNonAvail()
 #endif
 		if ( isRunning & VIASAT )
 			abortTimer->start(300000, true);
+		else if ( isRunning & MHW )
+			abortTimer->start(500000, true);
 		else if ( isRunning )
 			abortTimer->start(90000, true);
 		else
@@ -2764,40 +2772,52 @@ void eEPGCache::channel_data::readFreeSatScheduleOtherData( const uint8_t *data)
 }
 #endif
 
+/** @copydoc eEPGCache::lookupEventTime
+ */
 RESULT eEPGCache::lookupEventTime(const eServiceReference &service, time_t t, const eventData *&result, int direction)
-// if t == -1 we search the current event...
 {
 	uniqueEPGKey key(handleGroup(service));
 
-	// check if EPG for this service is ready...
+	// check whether EPG for this service is ready...
 	eventCache::iterator It = eventDB.find( key );
-	if ( It != eventDB.end() && !It->second.byEvent.empty() ) // entrys cached ?
+	if ( It != eventDB.end() && !It->second.byEvent.empty() ) // entries cached ?
 	{
-		if (t==-1)
+		if ( t == -1 )
 			t = ::time(0);
-		timeMap::iterator i = direction <= 0 ? It->second.byTime.lower_bound(t) :  // find > or equal
-			It->second.byTime.upper_bound(t); // just >
-		if ( i != It->second.byTime.end() )
+		timeMap::iterator i = It->second.byTime.upper_bound(t); // find first > t
+		if ( direction > 0 )
 		{
-			if ( direction < 0 || (direction == 0 && i->first > t) )
-			{
-				timeMap::iterator x = i;
-				--x;
-				if ( x != It->second.byTime.end() )
-				{
-					time_t start_time = x->first;
-					if (direction >= 0)
-					{
-						if (t < start_time)
-							return -1;
-						if (t > (start_time+x->second->getDuration()))
-							return -1;
-					}
-					i = x;
-				}
-				else
-					return -1;
+			if ( i != It->second.byTime.end() ) {
+				result = i->second;
+				return 0;
 			}
+			else
+				return -1;
+		}
+
+		// direction <= 0
+		if ( i == It->second.byTime.begin() )
+			return -1;
+		--i;
+		// time_t start_time = i->first;
+		time_t end_time = i->first + i->second->getDuration();
+		if ( direction == 0 ) {
+			// start_time <= t from map and iterator properties
+			if ( t < end_time ) {
+				result = i->second;
+				return 0;
+			}
+			else
+				return -1;
+		}
+
+		// direction < 0
+		if ( t >= end_time ) {
+			result = i->second;
+			return 0;
+		}
+		if ( i != It->second.byTime.begin() ) {
+			--i;
 			result = i->second;
 			return 0;
 		}
@@ -2805,6 +2825,24 @@ RESULT eEPGCache::lookupEventTime(const eServiceReference &service, time_t t, co
 	return -1;
 }
 
+/**
+ * @brief Look up an event in the EPG database by service reference and time.
+ * The service reference is specified in @p service.
+ * The lookup time is in @p t.
+ * The @p direction specifies whether to return the event matching @p t, its
+ * predecessor or successor.
+ *
+ * @param service as an eServiceReference.
+ * @param t the lookup time. If t == -1, look up the current time.
+ * @param result the matched event, if one is found.
+ * @param direction The event offset from the match.
+ * @p direction > 0 return the earliest event that starts after t.
+ * @p direction == 0 return the event that spans t. If t is spanned by a gap in the EPG, return None.
+ * @p direction < 0 return the event immediately before the event that spans t.  * If t is spanned by a gap in the EPG, return the event immediately before the gap.
+ * @return 0 for successful match and valid data in @p result,
+ * -1 for unsuccessful.
+ * In a call from Python, a return of -1 corresponds to a return value of None.
+ */
 RESULT eEPGCache::lookupEventTime(const eServiceReference &service, time_t t, Event *& result, int direction)
 {
 	singleLock s(cache_lock);
@@ -2815,6 +2853,8 @@ RESULT eEPGCache::lookupEventTime(const eServiceReference &service, time_t t, Ev
 	return ret;
 }
 
+/** @copydoc eEPGCache::lookupEventTime
+ */
 RESULT eEPGCache::lookupEventTime(const eServiceReference &service, time_t t, ePtr<eServiceEvent> &result, int direction)
 {
 	singleLock s(cache_lock);
@@ -3030,6 +3070,8 @@ void fillTuple(ePyObject tuple, const char *argstring, int argcount, ePyObject s
 			case 'X':
 				++argcount;
 				continue;
+			case 'M': // GN return 10 items only
+				continue;
 			default:  // ignore unknown
 				tmp = ePyObject();
 				eDebug("[eEPGCache] fillTuple unknown '%c'... insert 'None' in result", c);
@@ -3095,6 +3137,7 @@ int handleEvent(eServiceEvent *ptr, ePyObject dest_list, const char* argstring, 
 //   X = Return a minimum of one tuple per service in the result list... even when no event was found.
 //       The returned tuple is filled with all available infos... non avail is filled as None
 //       The position and existence of 'X' in the format string has no influence on the result tuple... its completely ignored..
+//   M = see X just 10 events are returned
 // then for each service follows a tuple
 //   first tuple entry is the servicereference (as string... use the ref.toString() function)
 //   the second is the type of query
@@ -3145,6 +3188,9 @@ PyObject *eEPGCache::lookupEvent(ePyObject list, ePyObject convertFunc)
 	bool forceReturnOne = strchr(argstring, 'X') ? true : false;
 	if (forceReturnOne)
 		--argcount;
+
+	bool forceReturnTen = strchr(argstring, 'M') ? true : false;
+	int returnTenItemsCount=1;
 
 	if (convertFunc)
 	{
@@ -3275,6 +3321,15 @@ PyObject *eEPGCache::lookupEvent(ePyObject list, ePyObject convertFunc)
 				{
 					while ( m_timemap_cursor != m_timemap_end )
 					{
+						if (forceReturnTen)  // GN return only 10 items
+						{
+							if (returnTenItemsCount > 10)
+							{
+								//eDebug("[eEPGCache] tuple entry no 10 is reached");
+								break;
+							}
+							returnTenItemsCount++;
+						}
 						Event ev((uint8_t*)m_timemap_cursor++->second->get());
 						eServiceEvent evt;
 						evt.parseFrom(&ev, currentQueryTsidOnid);
@@ -4986,7 +5041,8 @@ void eEPGCache::channel_data::readMHWData2(const uint8_t *data)
 			uint8_t slen = data[pos+18] & 0x3f;
 			uint8_t *dest = ((uint8_t*)title.title)-4;
 			memcpy(dest, &data[pos+19], slen>35 ? 35 : slen);
-			memset(dest+slen, 0, 35-slen);
+			if ( slen < 35 )
+				memset(dest+slen, 0, 35-slen);
 			pos += 19 + slen;
 //			eDebugNoNewLine("%02x [%02x %02x]: %s\n", data[pos], data[pos+1], data[pos+2], dest);
 
